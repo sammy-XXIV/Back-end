@@ -82,31 +82,48 @@ def tickers():
         ('binance', 'https://api.binance.com/api/v3/ticker/24hr'),
         ('bybit',   'https://api.bybit.com/v5/market/tickers?category=spot'),
         ('okx',     'https://www.okx.com/api/v5/market/tickers?instType=SPOT'),
+        ('mexc',    'https://api.mexc.com/api/v3/ticker/24hr'),
     ]
     for name, url in sources:
         try:
-            r = requests.get(url, timeout=8)
+            r = requests.get(url, timeout=10)
             if not r.ok: continue
             data = r.json()
-            if name == 'binance' and isinstance(data, list):
+            if name in ('binance', 'mexc') and isinstance(data, list):
                 for t in data:
                     if t.get('symbol','').endswith('USDT'):
                         sym = t['symbol'].replace('USDT','')
-                        all_prices.setdefault(sym,[]).append({'price':float(t['lastPrice']),'change':float(t['priceChangePercent']),'high':float(t['highPrice']),'low':float(t['lowPrice'])})
+                        if not sym: continue
+                        all_prices.setdefault(sym,[]).append({
+                            'price':float(t.get('lastPrice',0)),
+                            'change':float(t.get('priceChangePercent',0)),
+                            'high':float(t.get('highPrice',0)),
+                            'low':float(t.get('lowPrice',0)),
+                            'source': name
+                        })
             elif name == 'bybit':
                 for t in data.get('result',{}).get('list',[]):
                     if t.get('symbol','').endswith('USDT'):
                         sym = t['symbol'].replace('USDT','')
-                        all_prices.setdefault(sym,[]).append({'price':float(t['lastPrice']),'change':float(t.get('price24hPcnt',0))*100,'high':float(t['highPrice24h']),'low':float(t['lowPrice24h'])})
+                        all_prices.setdefault(sym,[]).append({'price':float(t['lastPrice']),'change':float(t.get('price24hPcnt',0))*100,'high':float(t['highPrice24h']),'low':float(t['lowPrice24h']),'source':'bybit'})
             elif name == 'okx':
                 for t in data.get('data',[]):
                     if t.get('instId','').endswith('-USDT'):
                         sym = t['instId'].replace('-USDT','')
                         o = float(t.get('open24h',1) or 1); l = float(t.get('last',0))
-                        all_prices.setdefault(sym,[]).append({'price':l,'change':((l-o)/o)*100,'high':float(t['high24h']),'low':float(t['low24h'])})
+                        all_prices.setdefault(sym,[]).append({'price':l,'change':((l-o)/o)*100,'high':float(t['high24h']),'low':float(t['low24h']),'source':'okx'})
         except: continue
 
-    result = {sym: {'price':sum(p['price'] for p in ps)/len(ps),'change':sum(p['change'] for p in ps)/len(ps),'high':max(p['high'] for p in ps),'low':min(p['low'] for p in ps),'sources':len(ps)} for sym,ps in all_prices.items() if ps}
+    result = {
+        sym: {
+            'price':  sum(p['price']  for p in ps) / len(ps),
+            'change': sum(p['change'] for p in ps) / len(ps),
+            'high':   max(p['high']   for p in ps),
+            'low':    min(p['low']    for p in ps),
+            'sources': len(ps)
+        }
+        for sym, ps in all_prices.items() if ps and sum(p['price'] for p in ps)/len(ps) > 0
+    }
     return jsonify(result)
 
 @app.route('/ticker', methods=['GET'])
@@ -205,6 +222,50 @@ def ticker():
         'volume': vol,
         'source': source,
     })
+
+@app.route('/mexc-scan', methods=['GET'])
+def mexc_scan():
+    """Fetch ALL MEXC futures tickers for scanner"""
+    try:
+        # MEXC futures contract tickers
+        r = requests.get('https://contract.mexc.com/api/v1/contract/ticker', timeout=15)
+        data = r.json().get('data', [])
+        result = {}
+        for t in data:
+            sym = t.get('symbol', '').replace('_USDT', '').replace('USDT', '')
+            if not sym: continue
+            last = float(t.get('lastPrice', 0) or 0)
+            if last <= 0: continue
+            change = float(t.get('priceChangeRate', 0) or 0) * 100
+            high = float(t.get('high24Price', last) or last)
+            low = float(t.get('low24Price', last) or last)
+            result[sym] = {
+                'price': last,
+                'change': round(change, 4),
+                'high': high,
+                'low': low,
+                'sources': 1,
+            }
+        # Also merge Binance tickers for more coverage
+        try:
+            rb = requests.get('https://api.binance.com/api/v3/ticker/24hr', timeout=8)
+            for t in rb.json():
+                if not t.get('symbol','').endswith('USDT'): continue
+                sym = t['symbol'].replace('USDT','')
+                if sym in result: continue  # MEXC takes priority
+                last = float(t.get('lastPrice', 0) or 0)
+                if last <= 0: continue
+                result[sym] = {
+                    'price': last,
+                    'change': round(float(t.get('priceChangePercent', 0)), 4),
+                    'high': float(t.get('highPrice', last)),
+                    'low': float(t.get('lowPrice', last)),
+                    'sources': 1,
+                }
+        except: pass
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/ping', methods=['GET'])
 def ping():
