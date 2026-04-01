@@ -39,15 +39,16 @@ def candles():
     interval = request.args.get('interval', '1h')
     limit    = int(request.args.get('limit', 80))
 
-    bybit_i = {'1h':'60','4h':'240','1d':'D','1w':'W'}.get(interval,'60')
-    okx_i   = {'1h':'1H','4h':'4H','1d':'1D','1w':'1W'}.get(interval,'1H')
-    mexc_i  = {'1h':'Min60','4h':'Hour4','1d':'Day1','1w':'Week1'}.get(interval,'Min60')
+    bybit_i  = {'1h':'60','4h':'240','1d':'D','1w':'W'}.get(interval,'60')
+    okx_i    = {'1h':'1H','4h':'4H','1d':'1D','1w':'1W'}.get(interval,'1H')
+    mexc_fi  = {'1h':'Min60','4h':'Hour4','1d':'Day1','1w':'Week1'}.get(interval,'Min60')
 
     sources = [
-        ('BINANCE', f'https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
-        ('BYBIT',   f'https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}USDT&interval={bybit_i}&limit={limit}', 'bybit'),
-        ('OKX',     f'https://www.okx.com/api/v5/market/candles?instId={symbol}-USDT&bar={okx_i}&limit={limit}', 'okx'),
-        ('MEXC',    f'https://contract.mexc.com/api/v1/contract/kline/{symbol}_USDT?interval={mexc_i}&limit={limit}', 'mexc'),
+        ('BINANCE',    f'https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
+        ('BYBIT',      f'https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}USDT&interval={bybit_i}&limit={limit}', 'bybit'),
+        ('OKX',        f'https://www.okx.com/api/v5/market/candles?instId={symbol}-USDT&bar={okx_i}&limit={limit}', 'okx'),
+        ('MEXC_SPOT',  f'https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
+        ('MEXC',       f'https://contract.mexc.com/api/v1/contract/kline/{symbol}_USDT?interval={mexc_fi}&limit={limit}', 'mexc'),
     ]
 
     for name, url, fmt in sources:
@@ -306,3 +307,4 @@ def ping():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
