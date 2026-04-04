@@ -38,41 +38,70 @@ def candles():
     symbol   = request.args.get('symbol', 'BTC').upper()
     interval = request.args.get('interval', '1h')
     limit    = int(request.args.get('limit', 80))
+    MIN_CANDLES = 50  # need at least 50 for reliable EMA50/RSI/MACD
 
-    bybit_i  = {'1h':'60','4h':'240','1d':'D','1w':'W'}.get(interval,'60')
-    okx_i    = {'1h':'1H','4h':'4H','1d':'1D','1w':'1W'}.get(interval,'1H')
-    mexc_fi  = {'1h':'Min60','4h':'Hour4','1d':'Day1','1w':'Week1'}.get(interval,'Min60')
+    bybit_i  = {'15m':'15','1h':'60','4h':'240','1d':'D','1w':'W'}.get(interval,'60')
+    okx_i    = {'15m':'15m','1h':'1H','4h':'4H','1d':'1D','1w':'1W'}.get(interval,'1H')
+    mexc_fi  = {'15m':'Min15','1h':'Min60','4h':'Hour4','1d':'Day1','1w':'Week1'}.get(interval,'Min60')
 
     sources = [
-        ('BINANCE',    f'https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
-        ('BYBIT',      f'https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}USDT&interval={bybit_i}&limit={limit}', 'bybit'),
-        ('OKX',        f'https://www.okx.com/api/v5/market/candles?instId={symbol}-USDT&bar={okx_i}&limit={limit}', 'okx'),
-        ('MEXC_SPOT',  f'https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
-        ('MEXC',       f'https://contract.mexc.com/api/v1/contract/kline/{symbol}_USDT?interval={mexc_fi}&limit={limit}', 'mexc'),
+        ('BINANCE',   f'https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
+        ('BYBIT',     f'https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}USDT&interval={bybit_i}&limit={limit}', 'bybit'),
+        ('OKX',       f'https://www.okx.com/api/v5/market/candles?instId={symbol}-USDT&bar={okx_i}&limit={limit}', 'okx'),
+        ('MEXC_SPOT', f'https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
+        ('MEXC',      f'https://contract.mexc.com/api/v1/contract/kline/{symbol}_USDT?interval={mexc_fi}&limit={limit}', 'mexc'),
     ]
+
+    best = None  # track best result in case none meet minimum
 
     for name, url, fmt in sources:
         try:
             r = requests.get(url, timeout=8)
-            if not r.ok: continue
+            if not r.ok:
+                log.warning(f"Candles {name} HTTP {r.status_code} for {symbol}")
+                continue
             data = r.json()
             out = []
-            if fmt == 'binance' and isinstance(data, list) and len(data) > 5:
-                out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in data]
+            if fmt == 'binance' and isinstance(data, list):
+                out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in data if float(c[4]) > 0]
             elif fmt == 'bybit':
                 lst = data.get('result',{}).get('list',[])
-                if lst: out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in reversed(lst)]
+                if lst: out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in reversed(lst) if float(c[4]) > 0]
             elif fmt == 'okx':
                 lst = data.get('data',[])
-                if lst: out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in reversed(lst)]
+                if lst: out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in reversed(lst) if float(c[4]) > 0]
             elif fmt == 'mexc':
                 d = data.get('data',{})
                 if d and d.get('time'):
-                    out = [{'o':float(d['open'][i]),'h':float(d['high'][i]),'l':float(d['low'][i]),'c':float(d['close'][i]),'v':float(d['vol'][i])} for i in range(len(d['time']))]
-            if out:
+                    out = [{'o':float(d['open'][i]),'h':float(d['high'][i]),'l':float(d['low'][i]),'c':float(d['close'][i]),'v':float(d['vol'][i])} for i in range(len(d['time'])) if float(d['close'][i]) > 0]
+
+            if not out:
+                log.warning(f"Candles {name} returned empty for {symbol}")
+                continue
+
+            log.info(f"Candles {name} returned {len(out)} candles for {symbol}")
+
+            # Keep best result so far
+            if best is None or len(out) > len(best['candles']):
+                best = {'source': name, 'candles': out}
+
+            # Return immediately if we have enough candles
+            if len(out) >= MIN_CANDLES:
                 return jsonify({'source': name, 'candles': out})
-        except:
+
+        except Exception as e:
+            log.warning(f"Candles {name} error for {symbol}: {e}")
             continue
+
+    # Return best available even if below minimum — flag it
+    if best:
+        candle_count = len(best['candles'])
+        log.warning(f"Best candles for {symbol}: {candle_count} from {best['source']} (below MIN_CANDLES={MIN_CANDLES})")
+        return jsonify({
+            'source': best['source'],
+            'candles': best['candles'],
+            'warning': f'Only {candle_count} candles available — analysis may be less accurate'
+        })
 
     return jsonify({'error': 'All sources failed', 'source': 'NONE'}), 503
 
