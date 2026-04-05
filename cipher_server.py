@@ -40,9 +40,9 @@ def candles():
     limit    = int(request.args.get('limit', 80))
     MIN_CANDLES = 50  # need at least 50 for reliable EMA50/RSI/MACD
 
-    bybit_i  = {'15m':'15','1h':'60','4h':'240','1d':'D','1w':'W'}.get(interval,'60')
-    okx_i    = {'15m':'15m','1h':'1H','4h':'4H','1d':'1D','1w':'1W'}.get(interval,'1H')
-    mexc_fi  = {'15m':'Min15','1h':'Min60','4h':'Hour4','1d':'Day1','1w':'Week1'}.get(interval,'Min60')
+    bybit_i  = {'5m':'5','15m':'15','1h':'60','4h':'240','1d':'D','1w':'W'}.get(interval,'60')
+    okx_i    = {'5m':'5m','15m':'15m','1h':'1H','4h':'4H','1d':'1D','1w':'1W'}.get(interval,'1H')
+    mexc_fi  = {'5m':'Min5','15m':'Min15','1h':'Min60','4h':'Hour4','1d':'Day1','1w':'Week1'}.get(interval,'Min60')
 
     sources = [
         ('BINANCE',   f'https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
@@ -336,4 +336,3 @@ def ping():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
