@@ -182,17 +182,18 @@ def tickers():
             log.warning(f"Tickers {name} error: {e}")
             continue
 
-    result = {
-        sym: {
-            'price':   round(sum(p['price']  for p in ps) / len(ps), 8),
+    result = {}
+    for sym, ps in all_prices.items():
+        if not ps: continue
+        avg_price = sum(p['price'] for p in ps) / len(ps)
+        if avg_price <= 0: continue
+        result[sym] = {
+            'price':   round(avg_price, 8),
             'change':  round(sum(p['change'] for p in ps) / len(ps), 2),
             'high':    max(p['high'] for p in ps),
             'low':     min(p['low']  for p in ps),
             'sources': len(ps),
         }
-        for sym, ps in all_prices.items()
-        if ps and sum(p['price'] for p in ps) / len(ps) > 0
-    }
     return jsonify(result)
 
 @app.route('/mexc-scan', methods=['GET'])
@@ -281,79 +282,64 @@ def ticker():
     price = change = high = low = vol = 0
     source = ''
 
-    # Try MEXC v3 API (more reliable than v2)
+    # Try Binance first (most accurate for major tokens)
     try:
-        r = requests.get(f"https://api.mexc.com/api/v3/ticker/24hr?symbol={symbol}USDT", timeout=8)
+        r = requests.get(f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}USDT", timeout=6)
         d = r.json()
-        if isinstance(d, dict) and float(d.get("lastPrice", 0)) > 0:
+        if isinstance(d, dict) and float(d.get("lastPrice", 0) or 0) > 0:
             price  = float(d["lastPrice"])
-            change = float(d["priceChangePercent"])
-            high   = float(d["highPrice"])
-            low    = float(d["lowPrice"])
-            vol    = float(d.get("quoteVolume", 0))
-            source = 'MEXC'
+            change = float(d.get("priceChangePercent", 0) or 0)
+            high   = float(d.get("highPrice", 0) or 0)
+            low    = float(d.get("lowPrice", 0) or 0)
+            vol    = float(d.get("quoteVolume", 0) or 0)
+            source = 'BINANCE'
     except Exception as e:
-        log.warning(f"MEXC v3 error: {e}")
+        log.warning(f"Binance ticker error: {e}")
 
-    # Try MEXC v2 API
+    # Try MEXC if Binance didn't have it (MEXC-only tokens)
     if not price:
         try:
-            r = requests.get(f"https://www.mexc.com/open/api/v2/market/ticker?symbol={symbol}_USDT", timeout=8)
-            d = r.json().get("data", [])
-            if isinstance(d, list) and d: d = d[0]
-            if isinstance(d, dict) and float(d.get("last", 0)) > 0:
-                price  = float(d["last"])
-                change = float(d.get("priceChangePercent", 0))
-                high   = float(d.get("high", 0))
-                low    = float(d.get("low", 0))
-                vol    = float(d.get("volume", 0))
-                source = 'MEXC'
-        except Exception as e:
-            log.warning(f"MEXC v2 error: {e}")
-
-    # Fallback Binance
-    if not price:
-        try:
-            r = requests.get(f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}USDT", timeout=8)
+            r = requests.get(f"https://api.mexc.com/api/v3/ticker/24hr?symbol={symbol}USDT", timeout=6)
             d = r.json()
-            if isinstance(d, dict) and float(d.get("lastPrice", 0)) > 0:
-                price  = float(d["lastPrice"])
-                change = float(d["priceChangePercent"])
-                high   = float(d["highPrice"])
-                low    = float(d["lowPrice"])
-                vol    = float(d.get("quoteVolume", 0))
-                source = 'BINANCE'
+            if isinstance(d, dict) and float(d.get("lastPrice", 0) or 0) > 0:
+                price      = float(d["lastPrice"])
+                high       = float(d.get("highPrice", 0) or 0)
+                low        = float(d.get("lowPrice", 0) or 0)
+                vol        = float(d.get("quoteVolume", 0) or 0)
+                open_price = float(d.get("openPrice", 0) or 0)
+                change     = ((price - open_price) / open_price * 100) if open_price > 0 else 0
+                source     = 'MEXC'
         except Exception as e:
-            log.warning(f"Binance error: {e}")
+            log.warning(f"MEXC ticker error: {e}")
 
-    # Fallback Bybit
+    # Bybit fallback
     if not price:
         try:
-            r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}USDT", timeout=8)
+            r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}USDT", timeout=6)
             d = r.json()["result"]["list"][0]
-            if float(d.get("lastPrice", 0)) > 0:
+            if float(d.get("lastPrice", 0) or 0) > 0:
                 price  = float(d["lastPrice"])
-                change = float(d.get("price24hPcnt", 0)) * 100
+                change = float(d.get("price24hPcnt", 0) or 0) * 100
                 high   = float(d["highPrice24h"])
                 low    = float(d["lowPrice24h"])
                 source = 'BYBIT'
         except Exception as e:
-            log.warning(f"Bybit error: {e}")
+            log.warning(f"Bybit ticker error: {e}")
 
-    # Fallback OKX
+    # OKX fallback
     if not price:
         try:
-            r = requests.get(f"https://www.okx.com/api/v5/market/ticker?instId={symbol}-USDT", timeout=8)
+            r = requests.get(f"https://www.okx.com/api/v5/market/ticker?instId={symbol}-USDT", timeout=6)
             d = r.json().get("data", [{}])[0]
-            if float(d.get("last", 0)) > 0:
+            if float(d.get("last", 0) or 0) > 0:
                 price  = float(d["last"])
-                open24 = float(d.get("open24h", 1) or 1)
-                change = ((price - open24) / open24) * 100
-                high   = float(d["high24h"])
-                low    = float(d["low24h"])
+                open24 = float(d.get("open24h", 0) or 0)
+                change = ((price - open24) / open24 * 100) if open24 > 0 else 0
+                high   = float(d.get("high24h", 0) or 0)
+                low    = float(d.get("low24h", 0) or 0)
                 source = 'OKX'
         except Exception as e:
-            log.warning(f"OKX error: {e}")
+            log.warning(f"OKX ticker error: {e}")
 
     if not price:
         return jsonify({'error': f'{symbol} not found on any exchange', 'symbol': symbol}), 404
