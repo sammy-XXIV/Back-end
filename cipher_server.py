@@ -8,9 +8,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("CIPHER-SERVER")
 
 app = Flask(__name__)
-CORS(app, origins="*", allow_headers=["Content-Type"], methods=["GET", "POST", "OPTIONS"])
+CORS(app, origins="*", allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "OPTIONS"])
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+NOTIFY_BOT_TOKEN = os.environ.get("NOTIFY_BOT_TOKEN", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://zttdlnavawepvhbtldgq.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_PiRo_l11XVyrqnhmn5NldQ_Ju0ItrBV")
 
 @app.after_request
 def add_cors(response):
@@ -31,13 +34,55 @@ def analyze():
         response = requests.post(
             'https://api.anthropic.com/v1/messages',
             headers={'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},
-            json={'model':'claude-3-5-sonnet-20241022','max_tokens':1000,'messages':[{'role':'user','content':prompt}]}
+            json={'model':'claude-sonnet-5','max_tokens':1000,'messages':[{'role':'user','content':prompt}]}
         )
         rj = response.json()
         if not response.ok or rj.get('type') == 'error':
             msg = rj.get('error', {}).get('message', f'Anthropic error {response.status_code}')
             return jsonify({'error': msg}), 502
         return jsonify(rj)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/notify', methods=['POST'])
+def notify():
+    if not NOTIFY_BOT_TOKEN:
+        return jsonify({'error': 'Bot token not configured on server'}), 500
+    try:
+        jwt = request.headers.get('Authorization', '').removeprefix('Bearer ').strip()
+        if not jwt:
+            return jsonify({'error': 'Not authenticated'}), 401
+        sb_headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {jwt}'}
+        user_res = requests.get(f'{SUPABASE_URL}/auth/v1/user', headers=sb_headers, timeout=10)
+        if not user_res.ok:
+            return jsonify({'error': 'Invalid session'}), 401
+        user_id = user_res.json().get('id')
+        prof_res = requests.get(
+            f'{SUPABASE_URL}/rest/v1/profiles',
+            params={'user_id': f'eq.{user_id}', 'select': 'telegram_chat_id,telegram_verified,notification_prefs'},
+            headers=sb_headers, timeout=10
+        )
+        profiles = prof_res.json() if prof_res.ok else []
+        prof = profiles[0] if profiles else None
+        if not prof or not prof.get('telegram_verified') or not prof.get('telegram_chat_id'):
+            return jsonify({'error': 'Telegram not linked'}), 403
+        data = request.get_json() or {}
+        text = data.get('text', '')
+        if not text or len(text) > 4000:
+            return jsonify({'error': 'Invalid text'}), 400
+        prefs = prof.get('notification_prefs') or {}
+        ntype = data.get('type', 'general')
+        if prefs.get(ntype) is False:
+            return jsonify({'ok': True, 'muted': True})
+        tg = requests.post(
+            f'https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/sendMessage',
+            json={'chat_id': prof['telegram_chat_id'], 'text': text, 'parse_mode': 'HTML'},
+            timeout=10
+        )
+        if not tg.ok:
+            log.error(f"Telegram send failed: {tg.text[:200]}")
+            return jsonify({'error': 'Telegram send failed'}), 502
+        return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
