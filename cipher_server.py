@@ -34,7 +34,7 @@ def analyze():
         response = requests.post(
             'https://api.anthropic.com/v1/messages',
             headers={'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},
-            json={'model':'claude-sonnet-5','max_tokens':1000,'messages':[{'role':'user','content':prompt}]}
+            json={'model':'claude-sonnet-5','max_tokens':3000,'messages':[{'role':'user','content':prompt}]}
         )
         rj = response.json()
         if not response.ok or rj.get('type') == 'error':
