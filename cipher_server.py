@@ -2,6 +2,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import os
+import re
+import json
+import time
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -14,6 +17,15 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 NOTIFY_BOT_TOKEN = os.environ.get("NOTIFY_BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://zttdlnavawepvhbtldgq.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_PiRo_l11XVyrqnhmn5NldQ_Ju0ItrBV")
+CRYPTORANK_API_KEY = os.environ.get("CRYPTORANK_API_KEY", "")
+
+# In-memory cache for the moving-scan (movement data changes fast but not per-request)
+_scan_cache = {"ts": 0, "data": None}
+SCAN_TTL = 300  # 5 minutes
+
+# Token-unlock cache — schedules barely change intraday
+_unlocks_cache = {"ts": 0, "data": None}
+UNLOCKS_TTL = 21600  # 6 hours
 
 @app.after_request
 def add_cors(response):
@@ -34,7 +46,8 @@ def analyze():
         response = requests.post(
             'https://api.anthropic.com/v1/messages',
             headers={'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},
-            json={'model':'claude-sonnet-5','max_tokens':3000,'messages':[{'role':'user','content':prompt}]}
+            json={'model':'claude-opus-5','max_tokens':4000,'messages':[{'role':'user','content':prompt}]},
+            timeout=100
         )
         rj = response.json()
         if not response.ok or rj.get('type') == 'error':
@@ -320,6 +333,206 @@ def mexc_scan():
         log.warning(f"MEXC v2 scan error: {e}")
 
     return jsonify({'error': 'MEXC unavailable'}), 503
+
+def _mexc_perp_bases():
+    """Set of base coins that have a USDT-margined perpetual on MEXC."""
+    r = requests.get('https://contract.mexc.com/api/v1/contract/detail', timeout=12)
+    r.raise_for_status()
+    bases = set()
+    for c in r.json().get('data', []):
+        if c.get('quoteCoin') == 'USDT' and c.get('baseCoin'):
+            bases.add(c['baseCoin'].upper())
+    return bases
+
+def _grade_from_score(s):
+    if s >= 8.5: return 'A+'
+    if s >= 7.5: return 'A'
+    if s >= 6.5: return 'B+'
+    if s >= 5.5: return 'B'
+    if s >= 4.5: return 'C+'
+    if s >= 3.5: return 'C'
+    if s >= 2.5: return 'D'
+    return 'F'
+
+def _score_mover(c):
+    """Grade a token for MOVER QUALITY (alive + moving), not stability.
+    Higher = better live setup. Returns (overall, scores) or None to exclude."""
+    price = c['price']
+    vol   = c['volume24h']
+    ch24  = c['change24h']
+    ch7d  = c['change7d']
+    ch30d = c['change30d']
+    rng   = ((c['high24h'] - c['low24h']) / c['low24h'] * 100) if c['low24h'] > 0 else 0
+
+    # ── HARD FILTERS — kill the corpses ──
+    if vol < 1_000_000:                       # untradeable / illiquid
+        return None
+    if abs(ch24) < 3 and abs(ch7d) < 6 and rng < 6:   # stagnant: flat day, flat week, tight range
+        return None
+    if price <= 0:
+        return None
+
+    # 1. MOMENTUM — magnitude of the 24h move (sweet spot 8-40%, spikes >70% capped)
+    a = abs(ch24)
+    if   a >= 70: momentum = 5.5
+    elif a >= 40: momentum = 8
+    elif a >= 20: momentum = 10
+    elif a >= 10: momentum = 8.5
+    elif a >= 5:  momentum = 6.5
+    else:         momentum = 4
+
+    # 2. SUSTAINED — moving on 7d in the SAME direction (not a one-candle spike)
+    same_dir = (ch24 >= 0) == (ch7d >= 0)
+    if same_dir and abs(ch7d) >= 15: sustained = 10
+    elif same_dir and abs(ch7d) >= 6: sustained = 8
+    elif same_dir:                    sustained = 6
+    elif abs(ch7d) < 4:               sustained = 5   # flat week, today isolated
+    else:                             sustained = 3   # 7d fighting today's move
+
+    # 3. VOLUME — log-ish scale, $1M floor already applied
+    if   vol >= 100_000_000: volume = 10
+    elif vol >= 30_000_000:  volume = 9
+    elif vol >= 10_000_000:  volume = 7.5
+    elif vol >= 3_000_000:   volume = 6
+    else:                    volume = 4.5
+
+    # 4. TREND CONSISTENCY — how many of 24h/7d/30d agree on direction
+    signs = [1 if x >= 0 else -1 for x in (ch24, ch7d, ch30d)]
+    agree = abs(sum(signs))          # 3 = all agree, 1 = split
+    trend = 10 if agree == 3 else 6 if agree == 1 else 3
+
+    weights = {'momentum': 0.35, 'sustained': 0.25, 'volume': 0.25, 'trend': 0.15}
+    scores = {'momentum': momentum, 'sustained': sustained, 'volume': volume, 'trend': trend}
+    overall = sum(scores[k] * w for k, w in weights.items())
+    return overall, scores
+
+def _build_moving_scan():
+    """Fetch CryptoRank movers, filter to MEXC perps, grade for mover-quality, sort."""
+    if not CRYPTORANK_API_KEY:
+        raise RuntimeError('CryptoRank API key not configured on server')
+
+    perp_bases = _mexc_perp_bases()
+
+    # CryptoRank v1 currencies — has the multi-window percentChange we need
+    cr = requests.get(
+        'https://api.cryptorank.io/v1/currencies',
+        params={'api_key': CRYPTORANK_API_KEY, 'limit': 1000},
+        timeout=20
+    )
+    cr.raise_for_status()
+    coins = cr.json().get('data', [])
+
+    STABLES = {'USDT','USDC','DAI','TUSD','BUSD','FDUSD','USDD','USDE','PYUSD'}
+    out = []
+    for coin in coins:
+        sym = (coin.get('symbol') or '').upper()
+        if not sym or sym in STABLES:
+            continue
+        if sym not in perp_bases:
+            continue
+        v = (coin.get('values') or {}).get('USD') or {}
+        row = {
+            'symbol': sym,
+            'name': coin.get('name', sym),
+            'price': float(v.get('price') or 0),
+            'change24h': float(v.get('percentChange24h') or 0),
+            'change7d': float(v.get('percentChange7d') or 0),
+            'change30d': float(v.get('percentChange30d') or 0),
+            'volume24h': float(v.get('volume24h') or 0),
+            'high24h': float(v.get('high24h') or 0),
+            'low24h': float(v.get('low24h') or 0),
+            'marketCap': float(v.get('marketCap') or 0),
+        }
+        graded = _score_mover(row)
+        if graded is None:
+            continue
+        overall, scores = graded
+        row['gradeScore'] = round(overall, 2)
+        row['grade'] = _grade_from_score(overall)
+        row['scores'] = {k: round(x, 1) for k, x in scores.items()}
+        out.append(row)
+
+    out.sort(key=lambda r: r['gradeScore'], reverse=True)
+    return {'updated': int(time.time() * 1000), 'count': len(out), 'tokens': out[:80]}
+
+@app.route('/moving-scan', methods=['GET'])
+def moving_scan():
+    """Live movers from CryptoRank, filtered to MEXC perps, graded for mover-quality."""
+    now = time.time()
+    if _scan_cache['data'] and (now - _scan_cache['ts']) < SCAN_TTL:
+        return jsonify(_scan_cache['data'])
+    try:
+        data = _build_moving_scan()
+        _scan_cache['data'] = data
+        _scan_cache['ts'] = now
+        return jsonify(data)
+    except Exception as e:
+        log.error(f"moving-scan error: {e}")
+        if _scan_cache['data']:   # serve stale rather than nothing
+            return jsonify(_scan_cache['data'])
+        return jsonify({'error': str(e)}), 502
+
+def _build_unlocks():
+    """Upcoming token unlocks from CryptoRank's public token-unlock page.
+    Only the publicly-visible (non-gated) rows; flags MEXC-perp tradeability."""
+    try:
+        perp = _mexc_perp_bases()
+    except Exception:
+        perp = set()
+
+    r = requests.get(
+        'https://cryptorank.io/token-unlock',
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
+        timeout=20
+    )
+    r.raise_for_status()
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+    if not m:
+        raise RuntimeError('unlock page structure changed')
+    rows = json.loads(m.group(1))['props']['pageProps']['fallbackData']['data']
+
+    out = []
+    for row in rows:
+        if row.get('isExclusive') or row.get('isHidden'):
+            continue  # gated behind "sign up to view" — do not scrape
+        sym = (row.get('symbol') or '').upper()
+        if not sym:
+            continue
+        price = float(row.get('price') or 0)
+        nu = row.get('nextUnlocks') or []
+        tokens_unlocking = sum(float(a.get('tokens') or 0) for a in nu)
+        out.append({
+            'symbol': sym,
+            'name': row.get('name', sym),
+            'date': row.get('date'),
+            'unlockPct': round(float(row.get('nextUnlockPercent') or 0), 2),
+            'unlockUsd': round(tokens_unlocking * price, 2),
+            'price': price,
+            'change24h': round(float(row.get('chg24h') or 0), 2),
+            'marketCap': float(row.get('marketCap') or 0),
+            'lockedPct': round(float(row.get('lockedTokensPercent') or 0), 1),
+            'image': row.get('image') or '',
+            'perp': sym in perp,
+        })
+    out.sort(key=lambda x: x['date'] or '')  # soonest first
+    return {'updated': int(time.time() * 1000), 'count': len(out), 'unlocks': out}
+
+@app.route('/unlocks', methods=['GET'])
+def unlocks():
+    """Upcoming token unlocks (public CryptoRank data), cached 6h."""
+    now = time.time()
+    if _unlocks_cache['data'] and (now - _unlocks_cache['ts']) < UNLOCKS_TTL:
+        return jsonify(_unlocks_cache['data'])
+    try:
+        data = _build_unlocks()
+        _unlocks_cache['data'] = data
+        _unlocks_cache['ts'] = now
+        return jsonify(data)
+    except Exception as e:
+        log.error(f"unlocks error: {e}")
+        if _unlocks_cache['data']:
+            return jsonify(_unlocks_cache['data'])
+        return jsonify({'error': str(e)}), 502
 
 @app.route('/ticker', methods=['GET'])
 def ticker():
