@@ -30,12 +30,43 @@ SCAN_TTL = 300  # 5 minutes
 _unlocks_cache = {"ts": 0, "data": None}
 UNLOCKS_TTL = 21600  # 6 hours
 
+def _fresh(close_ms, now_ms, max_age_ms):
+    """Binance keeps returning delisted pairs (status BREAK) with weeks-old prices; skip those."""
+    try:
+        return now_ms - float(close_ms) < max_age_ms
+    except (TypeError, ValueError):
+        return False
+
 @app.after_request
 def add_cors(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
+
+# /analyze is open (no login), so guard it from being used as a free AI proxy
+PROMPT_HEADER = 'You are CIPHER, elite'
+MAX_PROMPT_CHARS = 16000
+IP_LIMIT_PER_HOUR = 20
+DAILY_CAP = 300  # hard ceiling on AI spend, even against spoofed headers + rotating IPs
+ALLOWED_ORIGINS = ('https://tradewithcipher.online', 'https://www.tradewithcipher.online', 'http://localhost', 'http://127.0.0.1')
+_analyze_calls = {}  # ip -> [timestamps]; '*' -> all calls
+
+def _analyze_guard(ip, origin, prompt, now):
+    """Return an error message if the request must be refused, else record it and return None."""
+    if not (origin or '').startswith(ALLOWED_ORIGINS):
+        return 'Origin not allowed'
+    if not prompt.startswith(PROMPT_HEADER) or len(prompt) > MAX_PROMPT_CHARS:
+        return 'Invalid prompt'
+    mine = [t for t in _analyze_calls.get(ip, []) if now - t < 3600]
+    day = [t for t in _analyze_calls.get('*', []) if now - t < 86400]
+    if len(day) >= DAILY_CAP:
+        return 'Daily analysis limit reached — try again later'
+    if len(mine) >= IP_LIMIT_PER_HOUR:
+        return 'Too many analyses — try again in an hour'
+    _analyze_calls[ip] = mine + [now]
+    _analyze_calls['*'] = day + [now]
+    return None
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -46,6 +77,11 @@ def analyze():
         prompt = data.get('prompt', '')
         if not prompt:
             return jsonify({'error': 'No prompt provided'}), 400
+        ip = (request.headers.get('X-Forwarded-For') or request.remote_addr or '').split(',')[0].strip()
+        refused = _analyze_guard(ip, request.headers.get('Origin'), prompt, time.time())
+        if refused:
+            log.warning("analyze refused (%s) ip=%s origin=%s", refused, ip, request.headers.get('Origin'))
+            return jsonify({'error': refused}), 429 if 'limit' in refused.lower() or 'many' in refused else 403
         body = {'model':AI_MODEL,'max_tokens':4000,'messages':[{'role':'user','content':prompt}]}
         if ORBIO_API_KEY:
             response = requests.post(
@@ -126,13 +162,15 @@ def candles():
 
     bybit_i  = {'5m':'5','15m':'15','1h':'60','4h':'240','1d':'D','1w':'W'}.get(interval,'60')
     okx_i    = {'5m':'5m','15m':'15m','1h':'1H','4h':'4H','1d':'1D','1w':'1W'}.get(interval,'1H')
+    mexc_si  = {'1h':'60m','1w':'1W'}.get(interval, interval)  # MEXC spot rejects '1h'
     mexc_fi  = {'5m':'Min5','15m':'Min15','1h':'Min60','4h':'Hour4','1d':'Day1','1w':'Week1'}.get(interval,'Min60')
 
     sources = [
+        # same exchange order as /ticker, so candles and live price come from the same coin
         ('BINANCE',   f'https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
+        ('MEXC_SPOT', f'https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={mexc_si}&limit={limit}', 'binance'),
         ('BYBIT',     f'https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}USDT&interval={bybit_i}&limit={limit}', 'bybit'),
         ('OKX',       f'https://www.okx.com/api/v5/market/candles?instId={symbol}-USDT&bar={okx_i}&limit={limit}', 'okx'),
-        ('MEXC_SPOT', f'https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}', 'binance'),
         ('MEXC',      f'https://contract.mexc.com/api/v1/contract/kline/{symbol}_USDT?interval={mexc_fi}&limit={limit}', 'mexc'),
     ]
 
@@ -147,6 +185,9 @@ def candles():
             data = r.json()
             out = []
             if fmt == 'binance' and isinstance(data, list):
+                if data and not _fresh(data[-1][6], time.time() * 1000, 86_400_000):
+                    log.warning(f"Candles {name} stale for {symbol} (delisted pair)")
+                    continue
                 out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in data if float(c[4]) > 0]
             elif fmt == 'bybit':
                 lst = data.get('result',{}).get('list',[])
@@ -192,11 +233,12 @@ def candles():
 @app.route('/tickers', methods=['GET'])
 def tickers():
     all_prices = {}
+    # Priority order (same as /ticker and /candles): the first exchange listing a coin is the reference price
     sources = [
         ('binance', 'https://api.binance.com/api/v3/ticker/24hr'),
+        ('mexc',    'https://api.mexc.com/api/v3/ticker/24hr'),
         ('bybit',   'https://api.bybit.com/v5/market/tickers?category=spot'),
         ('okx',     'https://www.okx.com/api/v5/market/tickers?instType=SPOT'),
-        ('mexc',    'https://api.mexc.com/api/v3/ticker/24hr'),
     ]
     for name, url in sources:
         try:
@@ -204,8 +246,9 @@ def tickers():
             if not r.ok: continue
             data = r.json()
             if name == 'binance' and isinstance(data, list):
+                now_ms = time.time() * 1000
                 for t in data:
-                    if t.get('symbol','').endswith('USDT'):
+                    if t.get('symbol','').endswith('USDT') and _fresh(t.get('closeTime'), now_ms, 3_600_000):
                         sym = t['symbol'].replace('USDT','')
                         if not sym: continue
                         price = float(t.get('lastPrice', 0) or 0)
@@ -264,17 +307,30 @@ def tickers():
 
     result = {}
     for sym, ps in all_prices.items():
-        if not ps: continue
-        avg_price = sum(p['price'] for p in ps) / len(ps)
-        if avg_price <= 0: continue
-        result[sym] = {
-            'price':   round(avg_price, 8),
-            'change':  round(sum(p['change'] for p in ps) / len(ps), 2),
-            'high':    max(p['high'] for p in ps),
-            'low':     min(p['low']  for p in ps),
-            'sources': len(ps),
-        }
+        merged = _merge_prices(ps)
+        if merged:
+            result[sym] = merged
     return jsonify(result)
+
+MERGE_TOLERANCE = 0.2  # sources further than 20% from the reference are a different coin on the same ticker
+
+def _merge_prices(ps):
+    """Merge one ticker's quotes (given in exchange priority order). The first quote is the
+    reference; quotes far from it are dropped so two coins sharing a ticker never get averaged."""
+    ps = [p for p in ps if p['price'] > 0]
+    if not ps:
+        return None
+    ref = ps[0]['price']
+    ps = [p for p in ps if abs(p['price'] - ref) / ref <= MERGE_TOLERANCE]
+    highs = [p['high'] for p in ps if p['high'] > 0]
+    lows = [p['low'] for p in ps if p['low'] > 0]
+    return {
+        'price':   round(sum(p['price'] for p in ps) / len(ps), 8),
+        'change':  round(sum(p['change'] for p in ps) / len(ps), 2),
+        'high':    max(highs) if highs else 0,
+        'low':     min(lows) if lows else 0,
+        'sources': len(ps),
+    }
 
 @app.route('/mexc-scan', methods=['GET'])
 def mexc_scan():
@@ -604,7 +660,7 @@ def ticker():
     try:
         r = requests.get(f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}USDT", timeout=6)
         d = r.json()
-        if isinstance(d, dict) and float(d.get("lastPrice", 0) or 0) > 0:
+        if isinstance(d, dict) and float(d.get("lastPrice", 0) or 0) > 0 and _fresh(d.get("closeTime"), time.time() * 1000, 3_600_000):
             price  = float(d["lastPrice"])
             change = float(d.get("priceChangePercent", 0) or 0)
             high   = float(d.get("highPrice", 0) or 0)
@@ -671,6 +727,27 @@ def ticker():
         'volume': vol,
         'source': source,
     })
+
+@app.route('/funding', methods=['GET'])
+def funding():
+    """Latest perp funding rate: Binance futures, then MEXC perps. `price` (the analyzed coin's
+    price) rejects a perp that is a different coin on the same ticker."""
+    symbol = request.args.get('symbol', '').upper()
+    price = float(request.args.get('price') or 0)
+    same_coin = lambda p: not price or not p or abs(p - price) / price <= MERGE_TOLERANCE
+    try:
+        d = requests.get(f'https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}USDT&limit=1', timeout=6).json()
+        if isinstance(d, list) and d and same_coin(float(d[0].get('markPrice') or 0)):
+            return jsonify({'rate': float(d[0]['fundingRate']), 'source': 'BINANCE'})
+    except Exception as e:
+        log.warning(f"Binance funding error {symbol}: {e}")
+    try:
+        d = requests.get(f'https://contract.mexc.com/api/v1/contract/funding_rate/{symbol}_USDT', timeout=6).json().get('data') or {}
+        if 'fundingRate' in d and same_coin(float(d.get('fairPrice') or 0)):
+            return jsonify({'rate': float(d['fundingRate']), 'source': 'MEXC'})
+    except Exception as e:
+        log.warning(f"MEXC funding error {symbol}: {e}")
+    return jsonify({'error': 'no funding rate'}), 404
 
 @app.route('/ping', methods=['GET'])
 def ping():
