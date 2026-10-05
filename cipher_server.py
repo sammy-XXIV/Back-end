@@ -778,6 +778,33 @@ def open_interest():
         log.warning(f"MEXC OI error {symbol}: {e}")
     return jsonify({'error': 'no open interest'}), 404
 
+@app.route('/positioning', methods=['GET'])
+def positioning():
+    """Binance futures crowding data, now and 24h ago: % of accounts long, % of top-trader
+    positions long, and taker buy/sell volume ratio. `price` rejects a different coin on the same ticker."""
+    symbol = request.args.get('symbol', '').upper()
+    price = float(request.args.get('price') or 0)
+    base = 'https://fapi.binance.com'
+    q = f'?symbol={symbol}USDT&period=1h&limit=25'
+    try:
+        mark = float(requests.get(f'{base}/fapi/v1/premiumIndex?symbol={symbol}USDT', timeout=6).json().get('markPrice') or 0)
+        if not mark or (price and abs(mark - price) / price > MERGE_TOLERANCE):
+            return jsonify({'error': 'no positioning data'}), 404
+        acc = requests.get(f'{base}/futures/data/globalLongShortAccountRatio{q}', timeout=6).json()
+        top = requests.get(f'{base}/futures/data/topLongShortPositionRatio{q}', timeout=6).json()
+        tkr = requests.get(f'{base}/futures/data/takerlongshortRatio{q}', timeout=6).json()
+        pct = lambda rows, i: round(float(rows[i]['longAccount']) * 100, 1)
+        return jsonify({
+            'accounts_long_pct': pct(acc, -1), 'accounts_long_pct_24h': pct(acc, 0),
+            'top_long_pct': pct(top, -1), 'top_long_pct_24h': pct(top, 0),
+            # one hourly taker ratio swings 0.5 <-> 2.5; the 4h mean is what is worth reading
+            'taker_ratio_4h': round(sum(float(r['buySellRatio']) for r in tkr[-4:]) / len(tkr[-4:]), 2),
+            'source': 'BINANCE',
+        })
+    except Exception as e:
+        log.warning(f"positioning error {symbol}: {e}")
+        return jsonify({'error': 'no positioning data'}), 404
+
 @app.route('/ping', methods=['GET'])
 def ping():
     return jsonify({'status': 'CIPHER server online'})

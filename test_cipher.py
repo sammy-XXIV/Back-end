@@ -120,3 +120,31 @@ def test_candles_include_open_time_ms(monkeypatch):
     monkeypatch.setattr(cs.requests, 'get', lambda url, timeout: FakeResp(rows))
     c = cs.app.test_client().get('/candles?symbol=BTC&interval=1h').get_json()['candles']
     assert c[0]['t'] == rows[0][0] and c[-1]['t'] == rows[-1][0]
+
+
+def _ratio_rows(key, first, last, n=25):
+    rows = [{key: str(first)} for _ in range(n - 1)] + [{key: str(last)}]
+    return rows
+
+
+def test_positioning_binance_ratios(monkeypatch):
+    def get(url, timeout):
+        if 'premiumIndex' in url: return FakeResp({'markPrice': '0.1627'})
+        if 'globalLongShortAccountRatio' in url: return FakeResp([{'longAccount': '0.712'}] * 24 + [{'longAccount': '0.730'}])
+        if 'topLongShortPositionRatio' in url: return FakeResp([{'longAccount': '0.592'}] * 24 + [{'longAccount': '0.595'}])
+        if 'takerlongshortRatio' in url: return FakeResp(_ratio_rows('buySellRatio', 2.0, 1.0)[:21] + [{'buySellRatio': '1.2'}, {'buySellRatio': '1.4'}, {'buySellRatio': '1.6'}, {'buySellRatio': '1.8'}])
+        return FakeResp({})
+    monkeypatch.setattr(cs.requests, 'get', get)
+    j = cs.app.test_client().get('/positioning?symbol=CYS&price=0.1625').get_json()
+    assert j == {'accounts_long_pct': 73.0, 'accounts_long_pct_24h': 71.2, 'top_long_pct': 59.5, 'top_long_pct_24h': 59.2,
+                 'taker_ratio_4h': 1.5, 'source': 'BINANCE'}  # mean of the last 4 hourly ratios; one hour alone is noise
+
+
+def test_positioning_rejects_different_coin(monkeypatch):
+    monkeypatch.setattr(cs.requests, 'get', lambda url, timeout: FakeResp({'markPrice': '0.065'} if 'premiumIndex' in url else [{'longAccount': '0.5', 'buySellRatio': '1'}] * 25))
+    assert cs.app.test_client().get('/positioning?symbol=BEAM&price=0.0087').status_code == 404
+
+
+def test_positioning_not_listed(monkeypatch):
+    monkeypatch.setattr(cs.requests, 'get', lambda url, timeout: FakeResp({'code': -1121, 'msg': 'Invalid symbol.'}))
+    assert cs.app.test_client().get('/positioning?symbol=ZZZQQ').status_code == 404
