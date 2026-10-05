@@ -21,7 +21,6 @@ AI_MODEL = os.environ.get("AI_MODEL", 'anthropic/claude-opus-5' if ORBIO_API_KEY
 NOTIFY_BOT_TOKEN = os.environ.get("NOTIFY_BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://zttdlnavawepvhbtldgq.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_PiRo_l11XVyrqnhmn5NldQ_Ju0ItrBV")
-CRYPTORANK_API_KEY = os.environ.get("CRYPTORANK_API_KEY", "")
 
 # In-memory cache for the moving-scan (movement data changes fast but not per-request)
 _scan_cache = {"ts": 0, "data": None}
@@ -425,42 +424,80 @@ def _score_mover(c):
     overall = sum(scores[k] * w for k, w in weights.items())
     return overall, scores
 
-def _build_moving_scan():
-    """Fetch CryptoRank movers, filter to MEXC perps, grade for mover-quality, sort."""
-    if not CRYPTORANK_API_KEY:
-        raise RuntimeError('CryptoRank API key not configured on server')
-
-    perp_bases = _mexc_perp_bases()
-
-    # CryptoRank v1 currencies — has the multi-window percentChange we need
-    cr = requests.get(
-        'https://api.cryptorank.io/v1/currencies',
-        params={'api_key': CRYPTORANK_API_KEY, 'limit': 1000},
+def _cryptorank_page(path):
+    """Embedded Next.js data from a public CryptoRank page (no API key needed)."""
+    r = requests.get(
+        f'https://cryptorank.io{path}',
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
         timeout=20
     )
-    cr.raise_for_status()
-    coins = cr.json().get('data', [])
+    r.raise_for_status()
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+    if not m:
+        raise RuntimeError(f'cryptorank {path} structure changed')
+    return json.loads(m.group(1))['props']['pageProps']
 
+def _mexc_high_low():
+    """24h high/low per base coin from MEXC's public perp ticker (CryptoRank pages lack it)."""
+    try:
+        r = requests.get('https://contract.mexc.com/api/v1/contract/ticker', timeout=12)
+        r.raise_for_status()
+        return {
+            t['symbol'][:-5].upper(): (float(t.get('high24Price') or 0), float(t.get('lower24Price') or 0))
+            for t in r.json().get('data', []) if t.get('symbol', '').endswith('_USDT')
+        }
+    except Exception as e:
+        log.warning(f"mexc ticker error: {e}")
+        return {}
+
+def _build_moving_scan():
+    """Scrape CryptoRank's public gainers/losers/top-100 pages, filter to MEXC perps,
+    grade for mover-quality, sort. (Replaces the CryptoRank API, which went down.)"""
+    perp_bases = _mexc_perp_bases()
+
+    # ponytail: public pages only cover ~400 coins (150 gainers + 150 losers + top 100),
+    # fine for a movers scan; the old API pulled 1000
+    coins = {}
+    for path, key in (('/gainers', 'fallbackData'), ('/losers', 'fallbackData'), ('/all-coins-list', 'coins')):
+        try:
+            v = _cryptorank_page(path).get(key)
+            rows = v.get('data', []) if isinstance(v, dict) else (v or [])
+        except Exception as e:
+            log.warning(f"cryptorank {path} error: {e}")
+            continue
+        for c in rows:
+            coins.setdefault((c.get('symbol') or '').upper(), c)
+    if not coins:
+        raise RuntimeError('CryptoRank pages unavailable')
+
+    high_low = _mexc_high_low()
     STABLES = {'USDT','USDC','DAI','TUSD','BUSD','FDUSD','USDD','USDE','PYUSD'}
     out = []
-    for coin in coins:
-        sym = (coin.get('symbol') or '').upper()
+    for sym, coin in coins.items():
         if not sym or sym in STABLES:
             continue
         if sym not in perp_bases:
             continue
-        v = (coin.get('values') or {}).get('USD') or {}
+        price = float(coin.get('priceUsd') or 0)
+        pc = coin.get('priceChange') or {}   # top-100 page: % changes
+        hp = coin.get('histPrices') or {}    # gainers/losers pages: past prices
+        def change(k):
+            if pc.get(k) is not None:
+                return float(pc[k])
+            then = float((hp.get(k) or {}).get('USD') or 0)
+            return (price / then - 1) * 100 if price and then else 0.0
+        high, low = high_low.get(sym, (0, 0))
         row = {
             'symbol': sym,
             'name': coin.get('name', sym),
-            'price': float(v.get('price') or 0),
-            'change24h': float(v.get('percentChange24h') or 0),
-            'change7d': float(v.get('percentChange7d') or 0),
-            'change30d': float(v.get('percentChange30d') or 0),
-            'volume24h': float(v.get('volume24h') or 0),
-            'high24h': float(v.get('high24h') or 0),
-            'low24h': float(v.get('low24h') or 0),
-            'marketCap': float(v.get('marketCap') or 0),
+            'price': price,
+            'change24h': change('24H'),
+            'change7d': change('7D'),
+            'change30d': change('30D'),
+            'volume24h': float(coin.get('volume24hUsd') or 0),
+            'high24h': high,
+            'low24h': low,
+            'marketCap': float(coin.get('marketCap') or 0),
         }
         graded = _score_mover(row)
         if graded is None:
@@ -476,7 +513,7 @@ def _build_moving_scan():
 
 @app.route('/moving-scan', methods=['GET'])
 def moving_scan():
-    """Live movers from CryptoRank, filtered to MEXC perps, graded for mover-quality."""
+    """Live movers scraped from CryptoRank's public pages, filtered to MEXC perps, graded for mover-quality."""
     now = time.time()
     if _scan_cache['data'] and (now - _scan_cache['ts']) < SCAN_TTL:
         return jsonify(_scan_cache['data'])
