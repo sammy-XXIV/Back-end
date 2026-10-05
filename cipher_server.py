@@ -14,6 +14,10 @@ app = Flask(__name__)
 CORS(app, origins="*", allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "OPTIONS"])
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Orbio gateway (OpenAI-compatible, OpenRouter model ids) takes priority when its key is set
+ORBIO_API_KEY = os.environ.get("ORBIO_API_KEY", "")
+AI_KEY = ORBIO_API_KEY or ANTHROPIC_API_KEY
+AI_MODEL = os.environ.get("AI_MODEL", 'anthropic/claude-opus-5' if ORBIO_API_KEY else 'claude-opus-5')
 NOTIFY_BOT_TOKEN = os.environ.get("NOTIFY_BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://zttdlnavawepvhbtldgq.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_PiRo_l11XVyrqnhmn5NldQ_Ju0ItrBV")
@@ -36,18 +40,33 @@ def add_cors(response):
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    if not ANTHROPIC_API_KEY:
+    if not AI_KEY:
         return jsonify({'error': 'API key not configured on server'}), 500
     try:
         data = request.get_json()
         prompt = data.get('prompt', '')
         if not prompt:
             return jsonify({'error': 'No prompt provided'}), 400
+        body = {'model':AI_MODEL,'max_tokens':4000,'messages':[{'role':'user','content':prompt}]}
+        if ORBIO_API_KEY:
+            response = requests.post(
+                'https://api.orbio.so/api/v1/chat/completions',
+                headers={'Content-Type':'application/json','Authorization':f'Bearer {ORBIO_API_KEY}'},
+                json=body, timeout=100
+            )
+            rj = response.json()
+            if response.ok and rj.get('choices'):
+                # Reshape to the Anthropic response format the frontend parses
+                text = rj['choices'][0].get('message', {}).get('content') or ''
+                return jsonify({'content': [{'type': 'text', 'text': text}], 'model': rj.get('model')})
+            err = rj.get('error')
+            msg = err.get('message') if isinstance(err, dict) else (err or f'Orbio error {response.status_code}')
+            log.warning("Orbio %s: %s", response.status_code, json.dumps(rj)[:500])
+            return jsonify({'error': msg}), 502
         response = requests.post(
             'https://api.anthropic.com/v1/messages',
-            headers={'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},
-            json={'model':'claude-opus-5','max_tokens':4000,'messages':[{'role':'user','content':prompt}]},
-            timeout=100
+            headers={'Content-Type':'application/json','x-api-key':AI_KEY,'anthropic-version':'2023-06-01'},
+            json=body, timeout=100
         )
         rj = response.json()
         if not response.ok or rj.get('type') == 'error':
