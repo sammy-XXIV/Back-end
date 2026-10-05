@@ -188,17 +188,17 @@ def candles():
                 if data and not _fresh(data[-1][6], time.time() * 1000, 86_400_000):
                     log.warning(f"Candles {name} stale for {symbol} (delisted pair)")
                     continue
-                out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in data if float(c[4]) > 0]
+                out = [{'t':int(float(c[0])),'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in data if float(c[4]) > 0]
             elif fmt == 'bybit':
                 lst = data.get('result',{}).get('list',[])
-                if lst: out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in reversed(lst) if float(c[4]) > 0]
+                if lst: out = [{'t':int(float(c[0])),'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in reversed(lst) if float(c[4]) > 0]
             elif fmt == 'okx':
                 lst = data.get('data',[])
-                if lst: out = [{'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in reversed(lst) if float(c[4]) > 0]
+                if lst: out = [{'t':int(float(c[0])),'o':float(c[1]),'h':float(c[2]),'l':float(c[3]),'c':float(c[4]),'v':float(c[5])} for c in reversed(lst) if float(c[4]) > 0]
             elif fmt == 'mexc':
                 d = data.get('data',{})
                 if d and d.get('time'):
-                    out = [{'o':float(d['open'][i]),'h':float(d['high'][i]),'l':float(d['low'][i]),'c':float(d['close'][i]),'v':float(d['vol'][i])} for i in range(len(d['time'])) if float(d['close'][i]) > 0]
+                    out = [{'t':int(d['time'][i])*1000,'o':float(d['open'][i]),'h':float(d['high'][i]),'l':float(d['low'][i]),'c':float(d['close'][i]),'v':float(d['vol'][i])} for i in range(len(d['time'])) if float(d['close'][i]) > 0]
 
             if not out:
                 log.warning(f"Candles {name} returned empty for {symbol}")
@@ -748,6 +748,35 @@ def funding():
     except Exception as e:
         log.warning(f"MEXC funding error {symbol}: {e}")
     return jsonify({'error': 'no funding rate'}), 404
+
+@app.route('/oi', methods=['GET'])
+def open_interest():
+    """Perp open interest in USD with its 4h / 24h change (Binance), or current OI only (MEXC).
+    `price` rejects a perp that is a different coin on the same ticker."""
+    symbol = request.args.get('symbol', '').upper()
+    price = float(request.args.get('price') or 0)
+    same_coin = lambda p: not price or not p or abs(p - price) / price <= MERGE_TOLERANCE
+    pct = lambda now, then: round((now / then - 1) * 100, 2) if then else None
+    try:
+        rows = requests.get(f'https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}USDT&period=1h&limit=25', timeout=6).json()
+        if isinstance(rows, list) and len(rows) >= 5:
+            vals = [float(r['sumOpenInterestValue']) for r in rows]
+            implied = vals[-1] / float(rows[-1]['sumOpenInterest'] or 1)   # value / contracts = mark price
+            if same_coin(implied):
+                return jsonify({'oi_usd': vals[-1], 'change_4h': pct(vals[-1], vals[-5]),
+                                'change_24h': pct(vals[-1], vals[0]) if len(vals) >= 25 else None, 'source': 'BINANCE'})
+    except Exception as e:
+        log.warning(f"Binance OI error {symbol}: {e}")
+    try:
+        t = requests.get(f'https://contract.mexc.com/api/v1/contract/ticker?symbol={symbol}_USDT', timeout=6).json().get('data') or {}
+        fair = float(t.get('fairPrice') or 0)
+        if t.get('holdVol') and same_coin(fair):
+            size = float((requests.get(f'https://contract.mexc.com/api/v1/contract/detail?symbol={symbol}_USDT', timeout=6).json().get('data') or {}).get('contractSize') or 0)
+            if size:
+                return jsonify({'oi_usd': round(float(t['holdVol']) * size * fair, 2), 'change_4h': None, 'change_24h': None, 'source': 'MEXC'})
+    except Exception as e:
+        log.warning(f"MEXC OI error {symbol}: {e}")
+    return jsonify({'error': 'no open interest'}), 404
 
 @app.route('/ping', methods=['GET'])
 def ping():

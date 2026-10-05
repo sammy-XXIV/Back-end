@@ -79,3 +79,44 @@ def test_candles_skip_stale_source(monkeypatch):
     monkeypatch.setattr(cs.requests, 'get', lambda url, timeout: R(stale if 'binance' in url else fresh))
     j = cs.app.test_client().get('/candles?symbol=DATA&interval=1h').get_json()
     assert j['source'] == 'MEXC_SPOT' and j['candles'][-1]['c'] == 2.0
+
+
+class FakeResp:
+    def __init__(self, data): self.data, self.ok, self.status_code = data, True, 200
+    def json(self): return self.data
+
+
+def _oi_hist(values, price=0.25):
+    # Binance openInterestHist rows, oldest first; value / amount = price, used for the same-coin check
+    return [{'sumOpenInterestValue': str(v), 'sumOpenInterest': str(v / price)} for v in values]
+
+
+def test_oi_binance_change_over_24h(monkeypatch):
+    rows = _oi_hist([100e6] + [101e6] * 20 + [104e6, 105e6, 106e6, 110e6])  # 25 hourly points
+    monkeypatch.setattr(cs.requests, 'get', lambda url, timeout: FakeResp(rows))
+    j = cs.app.test_client().get('/oi?symbol=ENA&price=0.25').get_json()
+    assert j['source'] == 'BINANCE' and j['oi_usd'] == 110e6
+    assert j['change_24h'] == 10.0 and j['change_4h'] == round((110 / 101 - 1) * 100, 2)
+
+
+def test_oi_rejects_different_coin_and_falls_back_to_mexc(monkeypatch):
+    def get(url, timeout):
+        if 'binance' in url: return FakeResp(_oi_hist([1e6] * 25, price=0.065))   # Binance "BEAM" is another coin
+        if 'detail' in url: return FakeResp({'data': {'contractSize': 10}})
+        return FakeResp({'data': {'holdVol': 1_000_000, 'fairPrice': 0.0087}})
+    monkeypatch.setattr(cs.requests, 'get', get)
+    j = cs.app.test_client().get('/oi?symbol=BEAM&price=0.0087').get_json()
+    assert j['source'] == 'MEXC' and j['oi_usd'] == 87000.0 and j['change_24h'] is None
+
+
+def test_oi_none_found(monkeypatch):
+    monkeypatch.setattr(cs.requests, 'get', lambda url, timeout: FakeResp({'code': 400}))
+    assert cs.app.test_client().get('/oi?symbol=ZZZQQ').status_code == 404
+
+
+def test_candles_include_open_time_ms(monkeypatch):
+    now_ms = int(cs.time.time() * 1000)
+    rows = [[now_ms - (60 - i) * 3_600_000, '1', '2', '0.5', '1.5', '10', now_ms] for i in range(60)]
+    monkeypatch.setattr(cs.requests, 'get', lambda url, timeout: FakeResp(rows))
+    c = cs.app.test_client().get('/candles?symbol=BTC&interval=1h').get_json()['candles']
+    assert c[0]['t'] == rows[0][0] and c[-1]['t'] == rows[-1][0]
